@@ -148,3 +148,41 @@ fn test_top_up() {
     assert_eq!(token.balance(&creator), 120);
     assert_eq!(token.balance(&contract_id), 30);
 }
+
+
+#[test]
+fn test_withdraw_all() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+
+    // Three subscribers, each deposits 100 tokens at rate 1/sec
+    let sub1 = Address::generate(&env);
+    let sub2 = Address::generate(&env);
+    let sub3 = Address::generate(&env);
+    token_admin.mint(&sub1, &100);
+    token_admin.mint(&sub2, &100);
+    token_admin.mint(&sub3, &100);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(0);
+    client.subscribe(&sub1, &creator, &token.address, &100, &1);
+    client.subscribe(&sub2, &creator, &token.address, &100, &1);
+    client.subscribe(&sub3, &creator, &token.address, &100, &1);
+
+    // Advance 10 seconds — each stream owes 10 tokens = 30 total
+    env.ledger().set_timestamp(10);
+
+    let collected = client.withdraw_all(&creator, &10);
+
+    assert_eq!(collected, 30);
+    assert_eq!(token.balance(&creator), 30);
+    assert_eq!(token.balance(&contract_id), 270); // 300 deposited - 30 collected
+}
