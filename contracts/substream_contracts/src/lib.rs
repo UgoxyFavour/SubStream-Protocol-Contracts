@@ -1,6 +1,7 @@
 #![no_std]
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 use soroban_sdk::token::Client as TokenClient;
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env};
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,9 +20,33 @@ pub struct Stream {
     pub percentages: Vec<u32>,
 }
 
+#[contractevent]
+pub struct TierChanged {
+    #[topic]
+    pub subscriber: Address,
+    #[topic]
+    pub creator: Address,
+    pub old_rate: i128,
+    pub new_rate: i128,
+}
+
 #[contract]
 pub struct SubStreamContract;
 
+#[contractimpl]
+impl SubStreamContract {
+    pub fn subscribe(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        token: Address,
+        amount: i128,
+        rate_per_second: i128,
+    ) {
+        subscriber.require_auth();
+
+        if amount <= 0 || rate_per_second <= 0 {
+            panic!("amount and rate must be positive");
 fn stream_key(subscriber: &Address, stream_id: &Address) -> DataKey {
     DataKey::Stream(subscriber.clone(), stream_id.clone())
 }
@@ -85,6 +110,12 @@ fn subscribe_internal(
         panic!("stream already exists");
     }
 
+        let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        if current_time <= stream.last_collected {
+            return;
+        }
     let token_client = TokenClient::new(env, token);
     token_client.transfer(subscriber, &env.current_contract_address(), &amount);
 
@@ -100,6 +131,19 @@ fn subscribe_internal(
     env.storage().persistent().set(&key, &stream);
 }
 
+        if amount_to_collect > 0 {
+            let token_client = TokenClient::new(&env, &stream.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &creator,
+                &amount_to_collect,
+            );
+
+            stream.balance -= amount_to_collect;
+            stream.last_collected = current_time;
+
+            env.storage().persistent().set(&key, &stream);
+        }
 fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
     let key = stream_key(subscriber, stream_id);
     if !env.storage().persistent().has(&key) {
@@ -136,6 +180,17 @@ fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
                 amount
             };
 
+        // Get updated stream
+        let stream: Stream = env.storage().persistent().get(&key).unwrap();
+
+        // Refund remaining balance to subscriber
+        if stream.balance > 0 {
+            let token_client = TokenClient::new(&env, &stream.token);
+            token_client.transfer(
+                &env.current_contract_address(),
+                &subscriber,
+                &stream.balance,
+            );
             if payout > 0 {
                 token_client.transfer(&env.current_contract_address(), &creator, &payout);
             }
@@ -257,6 +312,82 @@ impl SubStreamContract {
 
     pub fn top_up_group(env: Env, subscriber: Address, channel_id: Address, amount: i128) {
         top_up_internal(&env, &subscriber, &channel_id, amount);
+    }
+
+    /// Change the stream rate (tier) in one transaction without removing the stream.
+    /// Pending payouts at the previous rate are settled via `collect` first.
+    /// On downgrade (lower rate), excess buffer is prorated and refunded to the subscriber.
+    /// On upgrade, `additional_deposit` can add tokens in the same transaction (use 0 if none).
+    pub fn migrate_tier(
+        env: Env,
+        subscriber: Address,
+        creator: Address,
+        new_rate_per_second: i128,
+        additional_deposit: i128,
+    ) {
+        subscriber.require_auth();
+
+        if new_rate_per_second <= 0 {
+            panic!("new rate must be positive");
+        }
+        if additional_deposit < 0 {
+            panic!("additional deposit must be non-negative");
+        }
+
+        let key = DataKey::Stream(subscriber.clone(), creator.clone());
+        if !env.storage().persistent().has(&key) {
+            panic!("stream not found");
+        }
+
+        let stream_before: Stream = env.storage().persistent().get(&key).unwrap();
+        let old_rate = stream_before.rate_per_second;
+
+        Self::collect(env.clone(), subscriber.clone(), creator.clone());
+
+        let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
+        let mut balance = stream.balance;
+
+        if new_rate_per_second < old_rate && balance > 0 {
+            let tokens_to_keep = balance
+                .checked_mul(new_rate_per_second)
+                .expect("overflow")
+                .checked_div(old_rate)
+                .expect("old rate must be positive");
+            let refund = balance.saturating_sub(tokens_to_keep);
+            if refund > 0 {
+                let token_client = TokenClient::new(&env, &stream.token);
+                token_client.transfer(&env.current_contract_address(), &subscriber, &refund);
+                balance = tokens_to_keep;
+            }
+        }
+
+        stream.rate_per_second = new_rate_per_second;
+        stream.balance = balance;
+
+        if additional_deposit > 0 {
+            let token_client = TokenClient::new(&env, &stream.token);
+            token_client.transfer(
+                &subscriber,
+                &env.current_contract_address(),
+                &additional_deposit,
+            );
+            stream.balance = stream
+                .balance
+                .checked_add(additional_deposit)
+                .expect("overflow");
+        }
+
+        env.storage().persistent().set(&key, &stream);
+
+        if old_rate != new_rate_per_second {
+            TierChanged {
+                subscriber: subscriber.clone(),
+                creator: creator.clone(),
+                old_rate,
+                new_rate: new_rate_per_second,
+            }
+            .publish(&env);
+        }
     }
 }
 
