@@ -265,6 +265,14 @@
                   },
                   {
                     "key": {
+                      "symbol": "start_time"
+                    },
+                    "val": {
+                      "u64": "0"
+                    }
+                  },
+                  {
+                    "key": {
                       "symbol": "token"
                     },
                     "val": {

@@ -1,8 +1,12 @@
 #![no_std]
+use soroban_sdk::{ contract, contractimpl, contracttype, Address, Env };
 use soroban_sdk::{contract, contractimpl, contracttype, vec, Address, Env, Vec};
 use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Vec};
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, Address, Env};
+
+// Minimum flow duration: 24 hours in seconds (24 * 60 * 60 = 86400)
+const MINIMUM_FLOW_DURATION: u64 = 86400;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -19,6 +23,7 @@ pub struct Stream {
     pub rate_per_second: i128,
     pub balance: i128,
     pub last_collected: u64,
+    pub start_time: u64,
     pub creators: Vec<Address>,
     pub percentages: Vec<u32>,
 }
@@ -44,7 +49,7 @@ impl SubStreamContract {
         creator: Address,
         token: Address,
         amount: i128,
-        rate_per_second: i128,
+        rate_per_second: i128
     ) {
         subscriber.require_auth();
 
@@ -87,6 +92,14 @@ fn validate_distribution(
         }
     }
 
+        let current_time = env.ledger().timestamp();
+        let stream = Stream {
+            token,
+            rate_per_second,
+            balance: amount,
+            last_collected: current_time,
+            start_time: current_time,
+        };
     if total != 100 {
         panic!("percentages must sum to 100");
     }
@@ -145,6 +158,7 @@ fn subscribe_internal(
 
         if amount_to_collect > 0 {
             let token_client = TokenClient::new(&env, &stream.token);
+            token_client.transfer(&env.current_contract_address(), &creator, &amount_to_collect);
             token_client.transfer(
                 &env.current_contract_address(),
                 &creator,
@@ -169,6 +183,18 @@ fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
         return;
     }
 
+        // Get stream to check minimum duration
+        let stream: Stream = env.storage().persistent().get(&key).unwrap();
+        let current_time = env.ledger().timestamp();
+
+        // Check if minimum flow duration has been met
+        if current_time < stream.start_time + MINIMUM_FLOW_DURATION {
+            let remaining_time = stream.start_time + MINIMUM_FLOW_DURATION - current_time;
+            panic!("cannot cancel stream: minimum duration not met. {} seconds remaining", remaining_time);
+        }
+
+        // First collect any pending amount
+        Self::collect(env.clone(), subscriber.clone(), creator.clone());
     let time_elapsed = (current_time - stream.last_collected) as i128;
     let mut amount_to_collect = time_elapsed * stream.rate_per_second;
 

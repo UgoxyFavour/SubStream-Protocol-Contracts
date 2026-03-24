@@ -1,6 +1,7 @@
 #![cfg(test)]
 
 use super::*;
+use soroban_sdk::{ testutils::{ Address as _, Ledger }, token, Address, Env };
 use soroban_sdk::testutils::{Address as _, Events as _, Ledger};
 use soroban_sdk::{token, Address, Env, Event};
 use soroban_sdk::{testutils::{Address as _, Ledger}, token, vec, Address, Env};
@@ -73,13 +74,16 @@ fn test_cancel() {
     // Subscribe: 100 tokens, 1 token/sec
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
 
+    env.ledger().set_timestamp(100 + 86400 + 120); // 24h + 120 seconds pass (respect minimum duration)
+
+    // Cancel should collect 100 tokens (all balance depleted) for creator, refund 0 to subscriber
     env.ledger().set_timestamp(120); // 20 seconds pass
 
     // Cancel should collect 20 for creator, refund 80 to subscriber
     client.cancel(&subscriber, &creator);
 
-    assert_eq!(token.balance(&creator), 20);
-    assert_eq!(token.balance(&subscriber), 980);
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
     assert_eq!(token.balance(&contract_id), 0);
 }
 
@@ -152,6 +156,9 @@ fn test_top_up() {
     assert_eq!(token.balance(&contract_id), 30);
 }
 
+#[test]
+#[should_panic(expected = "cannot cancel stream: minimum duration not met")]
+fn test_cancel_before_minimum_duration() {
 
 #[test]
 fn test_withdraw_all() {
@@ -181,6 +188,17 @@ fn test_group_subscribe_and_collect_split() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // Subscribe at timestamp 100
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Try to cancel after only 1 hour (3600 seconds) - should fail
+    env.ledger().set_timestamp(100 + 3600);
+    client.cancel(&subscriber, &creator);
+}
+
+#[test]
+fn test_cancel_after_minimum_duration() {
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
 
@@ -257,6 +275,19 @@ fn test_group_cancel_collects_and_refunds_remaining_balance() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // Subscribe at timestamp 100
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Advance time beyond minimum duration (24 hours + 1 hour)
+    env.ledger().set_timestamp(100 + 86400 + 3600);
+
+    // Cancel should work now
+    client.cancel(&subscriber, &creator);
+
+    // Verify final state: creator gets all 100 tokens (balance depleted), subscriber gets no refund
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &10);
 
@@ -337,6 +368,7 @@ fn test_migrate_tier_emits_tier_changed_event() {
 }
 
 #[test]
+fn test_cancel_exactly_at_minimum_duration() {
 #[should_panic(expected = "group channel must contain exactly 5 creators")]
 fn test_group_requires_exactly_five_creators() {
     let env = Env::default();
@@ -358,6 +390,27 @@ fn test_group_requires_exactly_five_creators() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // Subscribe at timestamp 100
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Cancel exactly at minimum duration (24 hours later)
+    env.ledger().set_timestamp(100 + 86400);
+
+    // Cancel should work exactly at minimum duration
+    client.cancel(&subscriber, &creator);
+
+    // Verify final state: creator gets all 100 tokens (balance depleted), subscriber gets no refund
+    assert_eq!(token.balance(&creator), 100);
+    assert_eq!(token.balance(&subscriber), 900);
+    assert_eq!(token.balance(&contract_id), 0);
+}
+
+#[test]
+#[should_panic(
+    expected = "cannot cancel stream: minimum duration not met. 43200 seconds remaining"
+)]
+fn test_cancel_with_remaining_time_message() {
     env.ledger().set_timestamp(0);
     client.subscribe(&sub1, &creator, &token.address, &100, &1);
     client.subscribe(&sub2, &creator, &token.address, &100, &1);
@@ -432,6 +485,13 @@ fn test_group_percentages_must_sum_to_100() {
     let contract_id = env.register(SubStreamContract, ());
     let client = SubStreamContractClient::new(&env, &contract_id);
 
+    // Subscribe at timestamp 100
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &100, &1);
+
+    // Try to cancel after 12 hours (43200 seconds remaining)
+    env.ledger().set_timestamp(100 + 43200);
+    client.cancel(&subscriber, &creator);
     env.ledger().set_timestamp(100);
     client.subscribe(&subscriber, &creator, &token.address, &100, &1);
 
