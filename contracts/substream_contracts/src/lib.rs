@@ -7,6 +7,36 @@ const MINIMUM_FLOW_DURATION: u64 = 86400;
 const FREE_TRIAL_DURATION: u64 = 7 * 24 * 60 * 60;
 const GRACE_PERIOD: u64 = 24 * 60 * 60; // 24 hours in seconds
 
+const SIX_MONTHS: u64 = 180 * 24 * 60 * 60;
+
+fn calculate_discounted_charge(start_time: u64, charge_start: u64, now: u64, base_rate: i128) -> i128 {
+    if now <= charge_start {
+        return 0;
+    }
+
+    let mut total_charge: i128 = 0;
+    let mut current_t = charge_start;
+
+    while current_t < now {
+        let elapsed_since_start = current_t.saturating_sub(start_time);
+        let periods = elapsed_since_start / SIX_MONTHS;
+        let percent_discount = periods * 5;
+        let discount = if percent_discount > 100 { 100 } else { percent_discount };
+
+        let current_rate = base_rate * (100 - discount as i128) / 100;
+
+        let next_boundary = start_time + (periods + 1) * SIX_MONTHS;
+        let end_t = if now < next_boundary { now } else { next_boundary };
+
+        let duration = (end_t - current_t) as i128;
+        total_charge = total_charge.saturating_add(duration.saturating_mul(current_rate));
+
+        current_t = end_t;
+    }
+
+    total_charge
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -96,34 +126,7 @@ fn subscription_key(subscriber: &Address, stream_id: &Address) -> DataKey {
 
 /// Validates that the creators/percentages arrays are consistent and sum to 100.
 
-fn stream_exists(env: &Env, key: &DataKey) -> bool {
-    env.storage().persistent().has(key) || env.storage().temporary().has(key)
-}
 
-fn get_stream(env: &Env, key: &DataKey) -> Stream {
-    if env.storage().persistent().has(key) {
-        env.storage().persistent().get(key).unwrap()
-    } else if env.storage().temporary().has(key) {
-        env.storage().temporary().get(key).unwrap()
-    } else {
-        panic!("stream not found")
-    }
-}
-
-fn set_stream(env: &Env, key: &DataKey, stream: &Stream) {
-    if stream.balance > 0 {
-        env.storage().persistent().set(key, stream);
-        env.storage().temporary().remove(key);
-    } else {
-        env.storage().temporary().set(key, stream);
-        env.storage().persistent().remove(key);
-    }
-}
-
-fn remove_stream(env: &Env, key: &DataKey) {
-    env.storage().persistent().remove(key);
-    env.storage().temporary().remove(key);
-}
 
 fn validate_distribution(
     creators: &Vec<Address>,
@@ -270,10 +273,12 @@ impl SubStreamContract {
             return true;
         }
 
-        let elapsed = (now - charge_start) as i128;
-        let potential_charge = elapsed
-            .checked_mul(sub.tier.rate_per_second)
-            .unwrap_or(0);
+        let potential_charge = calculate_discounted_charge(
+            sub.start_time,
+            charge_start,
+            now,
+            sub.tier.rate_per_second,
+        );
         
         if sub.balance > potential_charge {
             return true;
@@ -665,8 +670,7 @@ fn calculate_stream_earned(env: &Env, key: &DataKey, creator: &Address, now: u64
     let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
     if now <= charge_start { return 0; }
 
-    let elapsed = (now - charge_start) as i128;
-    let mut gross_earned = elapsed.checked_mul(sub.tier.rate_per_second).unwrap_or(i128::MAX);
+    let mut gross_earned = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
     if gross_earned > sub.balance { gross_earned = sub.balance; }
 
     if sub.creators.len() > 1 {
@@ -826,16 +830,20 @@ fn distribute_and_collect(
     let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
     if now <= charge_start { return 0; }
 
-    let elapsed = (now - charge_start) as i128;
-    let mut amount_to_collect = elapsed.checked_mul(sub.tier.rate_per_second).unwrap_or(0);
+    let mut amount_to_collect = calculate_discounted_charge(
+        sub.start_time,
+        charge_start,
+        now,
+        sub.tier.rate_per_second,
+    );
     if amount_to_collect > sub.balance { amount_to_collect = sub.balance; }
     if amount_to_collect <= 0 { return 0; }
 
     let token_client = TokenClient::new(env, &sub.token);
     let mut remaining = amount_to_collect;
     // If already in debt and grace period expired, don't collect more
-    if stream.balance <= 0 && stream.last_funds_exhausted > 0 {
-        let grace_period_end = stream.last_funds_exhausted.saturating_add(GRACE_PERIOD);
+    if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
+        let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
         if now > grace_period_end {
             return 0;
         }
@@ -879,34 +887,34 @@ fn distribute_and_collect(
         }
     }
     // If balance is insufficient, check if we can still accrue debt (grace period).
-    if amount_to_collect >= stream.balance {
-        if stream.last_funds_exhausted == 0 {
+    if amount_to_collect >= sub.balance {
+        if sub.last_funds_exhausted == 0 {
             // First time running out of funds
             // Calculate more precise exhaustion time if possible, or just use now
-            stream.last_funds_exhausted = now;
+            sub.last_funds_exhausted = now;
         } else {
-            let grace_period_end = stream.last_funds_exhausted.saturating_add(GRACE_PERIOD);
+            let grace_period_end = sub.last_funds_exhausted.saturating_add(GRACE_PERIOD);
             if now > grace_period_end {
                 // Grace period expired, cap collection at remaining balance (if any)
-                amount_to_collect = if stream.balance > 0 { stream.balance } else { 0 };
+                amount_to_collect = if sub.balance > 0 { sub.balance } else { 0 };
             }
         }
     }
 
-    let available_balance = stream.balance.max(0);
+    let available_balance = sub.balance.max(0);
     let amount_to_transfer = amount_to_collect.min(available_balance);
 
     if amount_to_transfer > 0 {
-        let token_client = TokenClient::new(env, &stream.token);
+        let token_client = TokenClient::new(env, &sub.token);
         let mut remaining = amount_to_transfer;
-        let creators_len = stream.creators.len();
+        let creators_len = sub.creators.len();
 
         for i in 0..creators_len {
-            let creator = stream.creators.get(i).unwrap();
+            let creator = sub.creators.get(i).unwrap();
             let payout = if (i + 1) == creators_len {
                 remaining
             } else {
-                let percentage = stream.percentages.get(i).unwrap() as i128;
+                let percentage = sub.percentages.get(i).unwrap() as i128;
                 let amount = (amount_to_transfer * percentage) / 100;
                 remaining -= amount;
                 amount
@@ -932,90 +940,7 @@ fn distribute_and_collect(
 }
 
  
-fn collect_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
-    let key = stream_key(subscriber, stream_id);
-    if !env.storage().persistent().has(&key) {
-        panic!("stream not found");
-    }
-    let mut stream: Stream = env.storage().persistent().get(&key).unwrap();
-    let current_time = env.ledger().timestamp();
-    
-    let trial_end = stream
-        .start_time
-        .saturating_add(stream.tier.trial_duration);
-    let charge_start = if stream.last_collected > trial_end {
-        stream.last_collected
-    } else {
-        trial_end
-    };
 
-    if current_time <= charge_start {
-        return;
-    }
-
-    let time_elapsed = (current_time - charge_start) as i128;
-    let mut amount_to_collect = time_elapsed
-        .checked_mul(stream.tier.rate_per_second)
-        .unwrap_or(0);
-
-    // If already in debt and grace period expired, don't collect more
-    if stream.balance <= 0 && stream.last_funds_exhausted > 0 {
-        let grace_period_end = stream.last_funds_exhausted.saturating_add(GRACE_PERIOD);
-        if current_time > grace_period_end {
-            return;
-        }
-    }
-
-    if amount_to_collect <= 0 {
-        return;
-    }
-
-    // If balance is insufficient, check if we can still accrue debt (grace period).
-    if amount_to_collect >= stream.balance {
-        if stream.last_funds_exhausted == 0 {
-            // First time running out of funds
-            stream.last_funds_exhausted = current_time;
-        } else {
-            let grace_period_end = stream.last_funds_exhausted.saturating_add(GRACE_PERIOD);
-            if current_time > grace_period_end {
-                // Grace period expired, cap collection at remaining balance (if any)
-                amount_to_collect = if stream.balance > 0 { stream.balance } else { 0 };
-            }
-        }
-    }
-
-    if amount_to_collect <= 0 {
-        return;
-    }
-    let available_balance = stream.balance.max(0);
-    let amount_to_transfer = amount_to_collect.min(available_balance);
-
-    if amount_to_transfer > 0 {
-        let token_client = TokenClient::new(env, &stream.token);
-        let mut remaining = amount_to_transfer;
-        let creators_len = stream.creators.len();
-        for i in 0..creators_len {
-            let creator = stream.creators.get(i).unwrap();
-            let payout = if (i + 1) == creators_len {
-                remaining
-            } else {
-                let percentage = stream.percentages.get(i).unwrap() as i128;
-                let amount = (amount_to_transfer * percentage) / 100;
-                remaining -= amount;
-                amount
-            };
-            if payout > 0 {
-                token_client.transfer(&env.current_contract_address(), &creator, &payout);
-            }
-        }
-    }
-    stream.balance -= amount_to_collect;
-    stream.last_collected = current_time;
-    env.storage().persistent().set(&key, &stream);
-    if let DataKey::Stream(_, creator_addr) = &key {
-        update_total_streamed(env, subscriber, creator_addr, amount_to_collect);
-    }
-}
 
 fn cancel_internal(env: &Env, beneficiary: &Address, stream_id: &Address) {
     let key = subscription_key(beneficiary, stream_id);
@@ -1082,30 +1007,25 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     // Only the payer is authorized to top up
     sub.payer.require_auth();
 
+    let old_balance = sub.balance;
+    
     let token_client = TokenClient::new(env, &sub.token);
     token_client.transfer(&sub.payer, &env.current_contract_address(), &amount);
     
     sub.balance += amount;
-    set_subscription(env, &key, &sub);
-    let mut stream: Stream = get_stream(env, &key);
-    let token_client = TokenClient::new(env, &stream.token);
-    token_client.transfer(subscriber, &env.current_contract_address(), &amount);
-    
-    let old_balance = stream.balance;
-    stream.balance += amount;
     
     // If there was debt, pay it out now from the top-up
     if old_balance < 0 {
         let debt_covered = amount.min(-old_balance);
         let mut remaining = debt_covered;
-        let creators_len = stream.creators.len();
+        let creators_len = sub.creators.len();
 
         for i in 0..creators_len {
-            let creator = stream.creators.get(i).unwrap();
+            let creator = sub.creators.get(i).unwrap();
             let payout = if (i + 1) == creators_len {
                 remaining
             } else {
-                let percentage = stream.percentages.get(i).unwrap() as i128;
+                let percentage = sub.percentages.get(i).unwrap() as i128;
                 let p = (debt_covered * percentage) / 100;
                 remaining -= p;
                 p
@@ -1118,14 +1038,20 @@ fn top_up_internal(env: &Env, beneficiary: &Address, stream_id: &Address, amount
     }
 
     // Reset grace period tracker if balance is now positive
-    if stream.balance > 0 {
-        stream.last_funds_exhausted = 0;
+    if sub.balance > 0 {
+        sub.last_funds_exhausted = 0;
     }
     
-    env.storage().persistent().set(&key, &stream);
+    set_subscription(env, &key, &sub);
 
     // Collect to pay any *extra* debt accrued since last collection and advance the clock
-    collect_internal(env, subscriber, stream_id);
+    // Use distribute_and_collect instead of the deprecated collect_internal
+    let creator_to_update = if sub.creators.len() == 1 {
+        Some(sub.creators.get(0).unwrap())
+    } else {
+        None
+    };
+    distribute_and_collect(env, beneficiary, stream_id, creator_to_update.as_ref());
 }
 
 fn cancel_group_internal(env: &Env, subscriber: &Address, stream_id: &Address) {
