@@ -196,6 +196,30 @@ impl SubStreamContract {
         token_client.transfer(&user, &creator, &amount);
         TipReceived { user, creator, token, amount }.publish(&env);
     }
+
+    pub fn subscribe_group(env: Env, payer: Address, channel_id: Address, token: Address, amount: i128, rate_per_second: i128, creators: Vec<Address>, percentages: Vec<u32>) {
+        // Validate exactly 5 creators
+        if creators.len() != 5 {
+            panic!("group channel must contain exactly 5 creators");
+        }
+        // Validate percentages sum to 100
+        let mut total_percentage: u32 = 0;
+        for i in 0..percentages.len() {
+            total_percentage += percentages.get(i).unwrap();
+        }
+        if total_percentage != 100 {
+            panic!("percentages must sum to 100");
+        }
+        subscribe_core(&env, &payer, &payer, &channel_id, &token, amount, rate_per_second, creators, percentages);
+    }
+
+    pub fn collect_group(env: Env, subscriber: Address, channel_id: Address) {
+        distribute_and_collect(&env, &subscriber, &channel_id, None);
+    }
+
+    pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
+        cancel_internal(&env, &subscriber, &channel_id);
+    }
 }
 
 // --- Internal Logic & Helpers ---
@@ -339,3 +363,8 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
 fn is_creator_paused(env: &Env, creator: &Address) -> bool {
     env.storage().persistent().get(&DataKey::ChannelPaused(creator.clone())).unwrap_or(false)
 }
+
+#[cfg(test)]
+mod test;
+#[cfg(test)]
+mod test_withdrawal_consistency;
