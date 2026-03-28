@@ -492,3 +492,346 @@ fn test_initialize_cannot_be_called_twice() {
     client.initialize(&admin);
     client.initialize(&attacker);
 }
+
+// ---------------------------------------------------------------------------
+// Flash-Stream Attack Simulation — Issue #26
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_flash_stream_attack_within_single_ledger() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let attacker = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&attacker, &1000000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Set timestamp to simulate a single ledger (5 seconds)
+    let ledger_time = 1000000u64;
+    env.ledger().set_timestamp(ledger_time);
+
+    // Attacker subscribes with minimal amount to bypass content gates
+    client.subscribe(&attacker, &creator, &token.address, &10, &1);
+
+    // Check that subscription is active immediately (within same ledger)
+    assert!(client.is_subscribed(&attacker, &creator));
+
+    // Attacker immediately cancels within the same ledger (5 second window)
+    // This should be prevented by minimum duration check
+    let result = std::panic::catch_unwind(|| {
+        client.cancel(&attacker, &creator);
+    });
+
+    // Should panic due to minimum duration not being met
+    assert!(result.is_err());
+
+    // Verify subscription still exists after failed cancel attempt
+    assert!(client.is_subscribed(&attacker, &creator));
+}
+
+#[test]
+fn test_flash_stream_attack_multiple_quick_subscriptions() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let attacker = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&attacker, &1000000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let base_time = 1000000u64;
+    
+    // Simulate multiple rapid subscriptions within short timeframes
+    for i in 0..5 {
+        let ledger_time = base_time + (i * 5); // Each "ledger" is 5 seconds
+        env.ledger().set_timestamp(ledger_time);
+        
+        let subscriber = Address::generate(&env);
+        
+        // Subscribe with minimal amount
+        client.subscribe(&subscriber, &creator, &token.address, &5, &1);
+        
+        // Verify subscription is active
+        assert!(client.is_subscribed(&subscriber, &creator));
+        
+        // Try to access content immediately after subscription
+        // This simulates bypassing content gates through rapid subscriptions
+        let is_active = client.is_subscribed(&subscriber, &creator);
+        assert!(is_active, "Subscription should be active for flash attack attempt {}", i);
+    }
+}
+
+#[test]
+fn test_flash_stream_attack_grace_period_exploitation() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let attacker = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&attacker, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let start_time = 1000000u64;
+    env.ledger().set_timestamp(start_time);
+
+    // Subscribe with very small amount that will be exhausted quickly
+    client.subscribe(&attacker, &creator, &token.address, &10, &100);
+
+    // Fast forward to exhaust funds but stay within grace period
+    let exhaust_time = start_time + 10; // 10 seconds later
+    env.ledger().set_timestamp(exhaust_time);
+    
+    // Collect to exhaust the balance
+    client.collect(&attacker, &creator);
+    
+    // Verify still subscribed due to grace period
+    assert!(client.is_subscribed(&attacker, &creator));
+    
+    // Attacker tries to exploit grace period by immediately resubscribing
+    let new_attacker = Address::generate(&env);
+    token_admin.mint(&new_attacker, &1000);
+    
+    env.ledger().set_timestamp(exhaust_time + 1); // 1 second later
+    
+    client.subscribe(&new_attacker, &creator, &token.address, &5, &1);
+    
+    // Both subscriptions should be active (original in grace period, new one active)
+    assert!(client.is_subscribed(&attacker, &creator));
+    assert!(client.is_subscribed(&new_attacker, &creator));
+}
+
+// ---------------------------------------------------------------------------
+// Blacklist Malicious Users — Issue #25
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_blacklist_user_prevents_subscription() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let malicious_user = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&malicious_user, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Creator blacklists the user
+    client.blacklist_user(&creator, &malicious_user);
+
+    // Verify user is blacklisted
+    assert!(client.is_user_blacklisted(&creator, &malicious_user));
+
+    // Attempt to subscribe should fail
+    let result = std::panic::catch_unwind(|| {
+        client.subscribe(&malicious_user, &creator, &token.address, &100, &1);
+    });
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_unblacklist_user_allows_subscription() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&user, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Creator blacklists the user
+    client.blacklist_user(&creator, &user);
+    assert!(client.is_user_blacklisted(&creator, &user));
+
+    // Creator unblacklists the user
+    client.unblacklist_user(&creator, &user);
+    assert!(!client.is_user_blacklisted(&creator, &user));
+
+    // Now subscription should work
+    client.subscribe(&user, &creator, &token.address, &100, &1);
+    assert!(client.is_subscribed(&user, &creator));
+}
+
+#[test]
+#[should_panic(expected = "user already blacklisted")]
+fn test_blacklist_already_blacklisted_user_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Blacklist user twice should panic
+    client.blacklist_user(&creator, &user);
+    client.blacklist_user(&creator, &user);
+}
+
+#[test]
+#[should_panic(expected = "user not blacklisted")]
+fn test_unblacklist_non_blacklisted_user_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Try to unblacklist user who isn't blacklisted should panic
+    client.unblacklist_user(&creator, &user);
+}
+
+#[test]
+fn test_blacklist_prevents_group_subscription() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator_1 = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let creator_3 = Address::generate(&env);
+    let creator_4 = Address::generate(&env);
+    let creator_5 = Address::generate(&env);
+    let channel_id = Address::generate(&env);
+    let malicious_user = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&malicious_user, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let creators = vec![
+        &env,
+        creator_1.clone(),
+        creator_2.clone(),
+        creator_3.clone(),
+        creator_4.clone(),
+        creator_5.clone(),
+    ];
+    let percentages = vec![&env, 20u32, 20u32, 20u32, 20u32, 20u32];
+
+    // One creator blacklists the user
+    client.blacklist_user(&creator_3, &malicious_user);
+
+    // Attempt group subscription should fail
+    let result = std::panic::catch_unwind(|| {
+        client.subscribe_group(
+            &malicious_user,
+            &channel_id,
+            &token.address,
+            &100,
+            &1,
+            &creators,
+            &percentages,
+        );
+    });
+
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_blacklist_only_affects_specific_creator() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator_1 = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let user = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&user, &2000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // Creator 1 blacklists the user
+    client.blacklist_user(&creator_1, &user);
+
+    // User should be blacklisted for creator_1 but not creator_2
+    assert!(client.is_user_blacklisted(&creator_1, &user));
+    assert!(!client.is_user_blacklisted(&creator_2, &user));
+
+    // Subscription to creator_1 should fail
+    let result = std::panic::catch_unwind(|| {
+        client.subscribe(&user, &creator_1, &token.address, &100, &1);
+    });
+    assert!(result.is_err());
+
+    // Subscription to creator_2 should succeed
+    client.subscribe(&user, &creator_2, &token.address, &100, &1);
+    assert!(client.is_subscribed(&user, &creator_2));
+}
+
+#[test]
+fn test_blacklist_with_existing_subscription() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let user = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&user, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    // User subscribes first
+    client.subscribe(&user, &creator, &token.address, &100, &1);
+    assert!(client.is_subscribed(&user, &creator));
+
+    // Creator then blacklists the user
+    client.blacklist_user(&creator, &user);
+    assert!(client.is_user_blacklisted(&creator, &user));
+
+    // Existing subscription should still work (blacklist only prevents new subscriptions)
+    assert!(client.is_subscribed(&user, &creator));
+
+    // But user cannot create a new subscription after cancelling
+    client.cancel(&user, &creator);
+    
+    let result = std::panic::catch_unwind(|| {
+        client.subscribe(&user, &creator, &token.address, &100, &1);
+    });
+    assert!(result.is_err());
+}

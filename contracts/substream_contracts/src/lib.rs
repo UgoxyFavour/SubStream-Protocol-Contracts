@@ -51,6 +51,7 @@ pub enum DataKey {
     CreatorSplit(Address),
     ContractAdmin,
     VerifiedCreator(Address),
+    BlacklistedUser(Address, Address), // (creator, user_to_block)
 }
 
 #[contracttype]
@@ -116,6 +117,18 @@ pub struct TipReceived {
 pub struct CreatorVerified {
     #[topic] pub creator: Address,
     #[topic] pub verified_by: Address,
+}
+
+#[contractevent]
+pub struct UserBlacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
+}
+
+#[contractevent]
+pub struct UserUnblacklisted {
+    #[topic] pub creator: Address,
+    #[topic] pub user: Address,
 }
 
 #[contract]
@@ -219,6 +232,47 @@ impl SubStreamContract {
 
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
+    }
+
+    // --- Blacklist functionality for Issue #25 ---
+    
+    pub fn blacklist_user(env: Env, creator: Address, user_to_block: Address) {
+        creator.require_auth();
+        
+        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_block.clone());
+        
+        // Check if already blacklisted
+        if env.storage().persistent().has(&blacklist_key) {
+            panic!("user already blacklisted");
+        }
+        
+        // Add to blacklist
+        env.storage().persistent().set(&blacklist_key, &true);
+        
+        // Emit event
+        UserBlacklisted { creator, user: user_to_block }.publish(&env);
+    }
+    
+    pub fn unblacklist_user(env: Env, creator: Address, user_to_unblock: Address) {
+        creator.require_auth();
+        
+        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_unblock.clone());
+        
+        // Check if user is actually blacklisted
+        if !env.storage().persistent().has(&blacklist_key) {
+            panic!("user not blacklisted");
+        }
+        
+        // Remove from blacklist
+        env.storage().persistent().remove(&blacklist_key);
+        
+        // Emit event
+        UserUnblacklisted { creator, user: user_to_unblock }.publish(&env);
+    }
+    
+    pub fn is_user_blacklisted(env: Env, creator: Address, user: Address) -> bool {
+        let blacklist_key = DataKey::BlacklistedUser(creator, user);
+        env.storage().persistent().get(&blacklist_key).unwrap_or(false)
     }
 }
 
@@ -339,6 +393,14 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     payer.require_auth();
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
+
+    // Check if beneficiary is blacklisted by any of the creators
+    for creator in &creators {
+        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), beneficiary.clone());
+        if env.storage().persistent().has(&blacklist_key) {
+            panic!("user is blacklisted by creator");
+        }
+    }
 
     let token_client = TokenClient::new(env, token);
     token_client.transfer(payer, &env.current_contract_address(), &amount);
