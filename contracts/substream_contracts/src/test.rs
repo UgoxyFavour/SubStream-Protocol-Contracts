@@ -835,3 +835,158 @@ fn test_blacklist_with_existing_subscription() {
     });
     assert!(result.is_err());
 }
+
+// ---------------------------------------------------------------------------
+// Creator stats caching
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_creator_stats_track_direct_stream_lifecycle() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(100);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &3);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 0,
+            lifetime_fans: 1,
+            active_fans: 1,
+        }
+    );
+
+    env.ledger().set_timestamp(100 + WEEK + 10);
+    client.collect(&subscriber, &creator);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 30,
+            lifetime_fans: 1,
+            active_fans: 1,
+        }
+    );
+
+    env.ledger().set_timestamp(100 + WEEK + DAY + 20);
+    client.cancel(&subscriber, &creator);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 30,
+            lifetime_fans: 1,
+            active_fans: 0,
+        }
+    );
+}
+
+#[test]
+fn test_creator_stats_do_not_double_count_same_fan_across_streams() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let fan = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let channel_id = Address::generate(&env);
+    let creator_2 = Address::generate(&env);
+    let creator_3 = Address::generate(&env);
+    let creator_4 = Address::generate(&env);
+    let creator_5 = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&fan, &5000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let creators = vec![
+        &env,
+        creator.clone(),
+        creator_2.clone(),
+        creator_3.clone(),
+        creator_4.clone(),
+        creator_5.clone(),
+    ];
+    let percentages = vec![&env, 20u32, 20u32, 20u32, 20u32, 20u32];
+
+    env.ledger().set_timestamp(0);
+    client.subscribe(&fan, &creator, &token.address, &200, &1);
+    client.subscribe_group(&fan, &channel_id, &token.address, &500, &1, &creators, &percentages);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 0,
+            lifetime_fans: 1,
+            active_fans: 1,
+        }
+    );
+
+    env.ledger().set_timestamp(DAY + 10);
+    client.cancel(&fan, &creator);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 0,
+            lifetime_fans: 1,
+            active_fans: 1,
+        }
+    );
+
+    client.cancel_group(&fan, &channel_id);
+
+    assert_eq!(
+        client.creator_stats(&creator),
+        CreatorStats {
+            total_earned: 0,
+            lifetime_fans: 1,
+            active_fans: 0,
+        }
+    );
+}
+
+#[test]
+fn test_creator_stats_scale_with_cached_counters() {
+    const FAN_COUNT: u64 = 200;
+
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    env.ledger().set_timestamp(500);
+
+    for _ in 0..FAN_COUNT {
+        let fan = Address::generate(&env);
+        token_admin.mint(&fan, &100);
+        client.subscribe(&fan, &creator, &token.address, &100, &1);
+    }
+
+    let stats = client.creator_stats(&creator);
+    assert_eq!(stats.lifetime_fans, FAN_COUNT);
+    assert_eq!(stats.active_fans, FAN_COUNT);
+    assert_eq!(stats.total_earned, 0);
+}
