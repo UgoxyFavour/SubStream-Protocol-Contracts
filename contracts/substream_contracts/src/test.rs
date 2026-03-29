@@ -3,6 +3,7 @@
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
+    testutils::Events as _,
     token, vec, Address, Env,
 };
 
@@ -12,6 +13,11 @@ const WEEK: u64 = 7 * DAY;
 fn create_token_contract<'a>(env: &Env, admin: &Address) -> token::Client<'a> {
     let sac = env.register_stellar_asset_contract_v2(admin.clone());
     token::Client::new(env, &sac.address())
+}
+
+fn last_call_contract_event_count(env: &Env, contract_id: &Address) -> usize {
+    let events = env.events().all().filter_by_contract(contract_id);
+    events.events().len()
 }
 
 // ---------------------------------------------------------------------------
@@ -109,6 +115,35 @@ fn test_free_trial_ignores_claims_within_first_week() {
     env.ledger().set_timestamp(start + WEEK + 9);
     client.collect(&subscriber, &creator);
     assert_eq!(token.balance(&creator), 27);
+}
+
+#[test]
+fn test_free_to_paid_transition_event_emitted_once() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let subscriber = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    let token = create_token_contract(&env, &admin);
+    let token_admin = token::StellarAssetClient::new(&env, &token.address);
+    token_admin.mint(&subscriber, &1000);
+
+    let contract_id = env.register(SubStreamContract, ());
+    let client = SubStreamContractClient::new(&env, &contract_id);
+
+    let start = 100u64;
+    env.ledger().set_timestamp(start);
+    client.subscribe(&subscriber, &creator, &token.address, &300, &1);
+
+    env.ledger().set_timestamp(start + WEEK + 1);
+    client.collect(&subscriber, &creator);
+    assert_eq!(last_call_contract_event_count(&env, &contract_id), 1);
+
+    env.ledger().set_timestamp(start + WEEK + 10);
+    client.collect(&subscriber, &creator);
+    assert_eq!(last_call_contract_event_count(&env, &contract_id), 0);
 }
 
 // ---------------------------------------------------------------------------

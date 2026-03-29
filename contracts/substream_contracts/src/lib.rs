@@ -1,6 +1,6 @@
 #![no_std]
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -72,6 +72,7 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
+    pub free_to_paid_emitted: bool,
     pub creators: Vec<Address>,
     pub percentages: Vec<u32>,
     pub payer: Address,
@@ -92,6 +93,14 @@ pub struct TierChanged {
     #[topic] pub creator: Address,
     pub old_rate: i128,
     pub new_rate: i128,
+}
+
+#[contractevent]
+pub struct FreeToPaidTierActivated {
+    #[topic] pub subscriber: Address,
+    #[topic] pub creator: Address,
+    pub rate_per_second: i128,
+    pub activated_at: u64,
 }
 
 #[contractevent]
@@ -330,6 +339,19 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
     let now = env.ledger().timestamp();
 
     if now <= sub.last_collected { return 0; }
+
+    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
+    if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
+        FreeToPaidTierActivated {
+            subscriber: beneficiary.clone(),
+            creator: stream_id.clone(),
+            rate_per_second: sub.tier.rate_per_second,
+            activated_at: now,
+        }
+        .publish(env);
+        sub.free_to_paid_emitted = true;
+    }
+
     if let Some(creator) = total_streamed_creator {
         if is_creator_paused(env, creator) {
             sub.last_collected = now;
@@ -338,11 +360,10 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
         }
     }
 
-    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
     let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
     if now <= charge_start { return 0; }
 
-    let mut amount_to_collect = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+    let amount_to_collect = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
     
     // Check if grace period is active or expired
     if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
@@ -436,6 +457,7 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         last_collected: now,
         start_time: now,
         last_funds_exhausted: 0,
+        free_to_paid_emitted: false,
         creators,
         percentages,
         payer: payer.clone(),
