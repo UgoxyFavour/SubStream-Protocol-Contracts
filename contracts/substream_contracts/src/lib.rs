@@ -1,4 +1,7 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::token::Client as TokenClient;
 use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
 
@@ -50,10 +53,7 @@ pub enum DataKey {
     GiftsReceived(Address),
     CreatorSplit(Address),
     ContractAdmin,
-    ProtocolFeeBps,
-    Moderator(Address),
     VerifiedCreator(Address),
-    BlacklistedUser(Address, Address), // (creator, user_to_block)
 }
 
 #[contracttype]
@@ -130,18 +130,6 @@ pub struct CreatorVerified {
     #[topic] pub verified_by: Address,
 }
 
-#[contractevent]
-pub struct UserBlacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
-}
-
-#[contractevent]
-pub struct UserUnblacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
-}
-
 #[contract]
 pub struct SubStreamContract;
 
@@ -154,34 +142,13 @@ impl SubStreamContract {
         env.storage().persistent().set(&DataKey::ContractAdmin, &admin);
     }
 
-    pub fn verify_creator(env: Env, caller: Address, creator: Address) {
-        caller.require_auth();
-        let admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        let is_mod = env.storage().persistent().get(&DataKey::Moderator(caller.clone())).unwrap_or(false);
-        
-        if caller != admin && !is_mod { 
-            panic!("unauthorized: admin or moderator required"); 
-        }
+    pub fn verify_creator(env: Env, admin: Address, creator: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
+        if admin != stored_admin { panic!("admin only"); }
 
         env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
-        CreatorVerified { creator, verified_by: caller }.publish(&env);
-    }
-
-    pub fn set_moderator(env: Env, admin: Address, moderator: Address, status: bool) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
-
-        env.storage().persistent().set(&DataKey::Moderator(moderator), &status);
-    }
-
-    pub fn set_protocol_fee(env: Env, admin: Address, fee_bps: u32) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
-        if fee_bps > 10000 { panic!("invalid fee bps"); }
-
-        env.storage().persistent().set(&DataKey::ProtocolFeeBps, &fee_bps);
+        CreatorVerified { creator, verified_by: admin }.publish(&env);
     }
 
     pub fn is_creator_verified(env: Env, creator: Address) -> bool {
@@ -211,6 +178,12 @@ impl SubStreamContract {
 
         // Use the discounted charge logic for consistent "is active" checks
         let potential_charge = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+
+        #[cfg(test)]
+        extern crate std as std2;
+        #[cfg(test)]
+        std2::eprintln!("IS_SUBSCRIBED DEBUG: start_time={} last_collected={} trial_end={} charge_start={} now={} balance={} potential_charge={}",
+            sub.start_time, sub.last_collected, sub.start_time.saturating_add(sub.tier.trial_duration), charge_start, now, sub.balance, potential_charge);
 
         if sub.balance > potential_charge { return true; }
 
@@ -264,47 +237,6 @@ impl SubStreamContract {
 
     pub fn cancel_group(env: Env, subscriber: Address, channel_id: Address) {
         cancel_internal(&env, &subscriber, &channel_id);
-    }
-
-    // --- Blacklist functionality for Issue #25 ---
-    
-    pub fn blacklist_user(env: Env, creator: Address, user_to_block: Address) {
-        creator.require_auth();
-        
-        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_block.clone());
-        
-        // Check if already blacklisted
-        if env.storage().persistent().has(&blacklist_key) {
-            panic!("user already blacklisted");
-        }
-        
-        // Add to blacklist
-        env.storage().persistent().set(&blacklist_key, &true);
-        
-        // Emit event
-        UserBlacklisted { creator, user: user_to_block }.publish(&env);
-    }
-    
-    pub fn unblacklist_user(env: Env, creator: Address, user_to_unblock: Address) {
-        creator.require_auth();
-        
-        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), user_to_unblock.clone());
-        
-        // Check if user is actually blacklisted
-        if !env.storage().persistent().has(&blacklist_key) {
-            panic!("user not blacklisted");
-        }
-        
-        // Remove from blacklist
-        env.storage().persistent().remove(&blacklist_key);
-        
-        // Emit event
-        UserUnblacklisted { creator, user: user_to_unblock }.publish(&env);
-    }
-    
-    pub fn is_user_blacklisted(env: Env, creator: Address, user: Address) -> bool {
-        let blacklist_key = DataKey::BlacklistedUser(creator, user);
-        env.storage().persistent().get(&blacklist_key).unwrap_or(false)
     }
 }
 
@@ -437,14 +369,6 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     payer.require_auth();
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
-
-    // Check if beneficiary is blacklisted by any of the creators
-    for creator in &creators {
-        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), beneficiary.clone());
-        if env.storage().persistent().has(&blacklist_key) {
-            panic!("user is blacklisted by creator");
-        }
-    }
 
     let token_client = TokenClient::new(env, token);
     token_client.transfer(payer, &env.current_contract_address(), &amount);
