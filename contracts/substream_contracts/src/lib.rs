@@ -1,6 +1,9 @@
 #![no_std]
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::token::Client as TokenClient;
-use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Bytes, Env, Vec};
+use soroban_sdk::{contract, contractevent, contractimpl, contracttype, vec, Address, Env, Vec};
 
 // --- Constants ---
 const MINIMUM_FLOW_DURATION: u64 = 86400;
@@ -50,8 +53,6 @@ pub enum DataKey {
     GiftsReceived(Address),
     CreatorSplit(Address),
     ContractAdmin,
-    ProtocolFeeBps,
-    Moderator(Address),
     VerifiedCreator(Address),
     BlacklistedUser(Address, Address), // (creator, user_to_block)
     CreatorAudience(Address, Address), // (creator, beneficiary)
@@ -73,6 +74,7 @@ pub struct Subscription {
     pub last_collected: u64,
     pub start_time: u64,
     pub last_funds_exhausted: u64,
+    pub free_to_paid_emitted: bool,
     pub creators: Vec<Address>,
     pub percentages: Vec<u32>,
     pub payer: Address,
@@ -111,6 +113,14 @@ pub struct TierChanged {
 }
 
 #[contractevent]
+pub struct FreeToPaidTierActivated {
+    #[topic] pub subscriber: Address,
+    #[topic] pub creator: Address,
+    pub rate_per_second: i128,
+    pub activated_at: u64,
+}
+
+#[contractevent]
 pub struct Subscribed {
     #[topic] pub subscriber: Address,
     #[topic] pub creator: Address,
@@ -137,18 +147,6 @@ pub struct CreatorVerified {
     #[topic] pub verified_by: Address,
 }
 
-#[contractevent]
-pub struct UserBlacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
-}
-
-#[contractevent]
-pub struct UserUnblacklisted {
-    #[topic] pub creator: Address,
-    #[topic] pub user: Address,
-}
-
 #[contract]
 pub struct SubStreamContract;
 
@@ -161,34 +159,13 @@ impl SubStreamContract {
         env.storage().persistent().set(&DataKey::ContractAdmin, &admin);
     }
 
-    pub fn verify_creator(env: Env, caller: Address, creator: Address) {
-        caller.require_auth();
-        let admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        let is_mod = env.storage().persistent().get(&DataKey::Moderator(caller.clone())).unwrap_or(false);
-        
-        if caller != admin && !is_mod { 
-            panic!("unauthorized: admin or moderator required"); 
-        }
+    pub fn verify_creator(env: Env, admin: Address, creator: Address) {
+        admin.require_auth();
+        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
+        if admin != stored_admin { panic!("admin only"); }
 
         env.storage().persistent().set(&DataKey::VerifiedCreator(creator.clone()), &true);
-        CreatorVerified { creator, verified_by: caller }.publish(&env);
-    }
-
-    pub fn set_moderator(env: Env, admin: Address, moderator: Address, status: bool) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
-
-        env.storage().persistent().set(&DataKey::Moderator(moderator), &status);
-    }
-
-    pub fn set_protocol_fee(env: Env, admin: Address, fee_bps: u32) {
-        admin.require_auth();
-        let stored_admin: Address = env.storage().persistent().get(&DataKey::ContractAdmin).expect("not initialized");
-        if admin != stored_admin { panic!("admin only"); }
-        if fee_bps > 10000 { panic!("invalid fee bps"); }
-
-        env.storage().persistent().set(&DataKey::ProtocolFeeBps, &fee_bps);
+        CreatorVerified { creator, verified_by: admin }.publish(&env);
     }
 
     pub fn is_creator_verified(env: Env, creator: Address) -> bool {
@@ -218,6 +195,12 @@ impl SubStreamContract {
 
         // Use the discounted charge logic for consistent "is active" checks
         let potential_charge = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+
+        #[cfg(test)]
+        extern crate std as std2;
+        #[cfg(test)]
+        std2::eprintln!("IS_SUBSCRIBED DEBUG: start_time={} last_collected={} trial_end={} charge_start={} now={} balance={} potential_charge={}",
+            sub.start_time, sub.last_collected, sub.start_time.saturating_add(sub.tier.trial_duration), charge_start, now, sub.balance, potential_charge);
 
         if sub.balance > potential_charge { return true; }
 
@@ -428,6 +411,19 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
     let now = env.ledger().timestamp();
 
     if now <= sub.last_collected { return 0; }
+
+    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
+    if !sub.free_to_paid_emitted && sub.tier.rate_per_second > 0 && now > trial_end {
+        FreeToPaidTierActivated {
+            subscriber: beneficiary.clone(),
+            creator: stream_id.clone(),
+            rate_per_second: sub.tier.rate_per_second,
+            activated_at: now,
+        }
+        .publish(env);
+        sub.free_to_paid_emitted = true;
+    }
+
     if let Some(creator) = total_streamed_creator {
         if is_creator_paused(env, creator) {
             sub.last_collected = now;
@@ -436,11 +432,10 @@ fn distribute_and_collect(env: &Env, beneficiary: &Address, stream_id: &Address,
         }
     }
 
-    let trial_end = sub.start_time.saturating_add(sub.tier.trial_duration);
     let charge_start = if sub.last_collected > trial_end { sub.last_collected } else { trial_end };
     if now <= charge_start { return 0; }
 
-    let mut amount_to_collect = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
+    let amount_to_collect = calculate_discounted_charge(sub.start_time, charge_start, now, sub.tier.rate_per_second);
     
     // Check if grace period is active or expired
     if sub.balance <= 0 && sub.last_funds_exhausted > 0 {
@@ -520,14 +515,6 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
     let key = subscription_key(beneficiary, stream_id);
     if subscription_exists(env, &key) { panic!("exists"); }
 
-    // Check if beneficiary is blacklisted by any of the creators
-    for creator in &creators {
-        let blacklist_key = DataKey::BlacklistedUser(creator.clone(), beneficiary.clone());
-        if env.storage().persistent().has(&blacklist_key) {
-            panic!("user is blacklisted by creator");
-        }
-    }
-
     let token_client = TokenClient::new(env, token);
     token_client.transfer(payer, &env.current_contract_address(), &amount);
 
@@ -540,6 +527,7 @@ fn subscribe_core(env: &Env, payer: &Address, beneficiary: &Address, stream_id: 
         last_collected: now,
         start_time: now,
         last_funds_exhausted: 0,
+        free_to_paid_emitted: false,
         creators,
         percentages,
         payer: payer.clone(),
